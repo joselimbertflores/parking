@@ -8,6 +8,7 @@ import {
   PrimaryGeneratedColumn,
 } from 'typeorm';
 import type { Relation } from 'typeorm';
+import { VehicleType } from '../../../common/enums/vehicle-type.enum.js';
 import { ParkingSegment } from '../../parking/entities/parking-segments.entity.js';
 import { ParkingSession } from '../../parking/entities/parking-sessions.entity.js';
 import { User } from '../../users/entities/users.entity.js';
@@ -25,6 +26,9 @@ export class Payment {
 
   @Column()
   plate: string;
+
+  @Column('enum', { enum: VehicleType })
+  vehicleType: VehicleType;
 
   @Index()
   @Column('integer')
