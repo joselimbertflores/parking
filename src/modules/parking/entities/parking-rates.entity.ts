@@ -1,11 +1,11 @@
-import { Check, Column, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
+import { Check, Column, Entity, PrimaryColumn } from 'typeorm';
 
 @Entity('parking_rates')
-@Index(['active'], { unique: true, where: '"active" = true' })
+@Check('"id" = 1')
 @Check('"intervalMinutes" > 0')
-@Check('"amount" >= 0')
+@Check(`"amount" >= 0 AND "amount" <> 'NaN'`)
 export class ParkingRate {
-  @PrimaryGeneratedColumn()
+  @PrimaryColumn('integer', { default: 1 })
   id: number;
 
   @Column('integer')
@@ -13,7 +13,4 @@ export class ParkingRate {
 
   @Column('numeric', { precision: 10, scale: 2 })
   amount: string;
-
-  @Column()
-  active: boolean;
 }

@@ -1,12 +1,4 @@
-import {
-  Check,
-  Column,
-  CreateDateColumn,
-  Entity,
-  Index,
-  ManyToOne,
-  PrimaryGeneratedColumn,
-} from 'typeorm';
+import { Check, Column, CreateDateColumn, Entity, Index, ManyToOne, PrimaryGeneratedColumn } from 'typeorm';
 import type { Relation } from 'typeorm';
 import { VehicleType } from '../../../common/enums/vehicle-type.enum.js';
 import { ParkingSegment } from '../../parking/entities/parking-segments.entity.js';
@@ -15,11 +7,10 @@ import { User } from '../../users/entities/users.entity.js';
 
 @Entity('payments')
 @Check('"durationMinutes" > 0')
+@Check('"intervalMinutes" > 0')
 @Check('"amount" >= 0')
 @Check(`"status" = 'confirmed' OR "parkingSessionId" IS NULL`)
-@Check(
-  `"method" <> 'cash' OR ("status" = 'confirmed' AND "recordedByUserId" IS NOT NULL)`,
-)
+@Check(`"method" <> 'cash' OR ("status" = 'confirmed' AND "recordedByUserId" IS NOT NULL)`)
 export class Payment {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -41,7 +32,15 @@ export class Payment {
   @Column('integer')
   durationMinutes: number;
 
-  @Column('numeric', { precision: 10, scale: 2 })
+  @Column('integer')
+  intervalMinutes: number;
+
+  // Fija el cierre cotizado cuando se recorta la vigencia del último bloque.
+  @Column('timestamptz', { nullable: true })
+  quotedExpiresAt: Date | null;
+
+  // Admite una jornada entera con bloques de un minuto al importe máximo de la tarifa.
+  @Column('numeric', { precision: 14, scale: 2 })
   amount: string;
 
   @Column('enum', { enum: ['cash', 'qr'] })

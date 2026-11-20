@@ -1,55 +1,110 @@
 import {
   ConflictException,
-  Injectable,
   NotFoundException,
+  Injectable,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { QueryFailedError, Repository } from 'typeorm';
-import { CreateParkingSegmentDto } from '../dto/create-parking-segment.dto.js';
-import { UpdateParkingSegmentDto } from '../dto/update-parking-segment.dto.js';
+import { ILike, QueryFailedError, Repository } from 'typeorm';
+import type { EntityManager } from 'typeorm';
+
+import type {
+  CreateParkingSegmentDto,
+  UpdateParkingSegmentDto,
+} from '../dto/parking-segment.dto.js';
+
 import { ParkingSegment } from '../entities/parking-segments.entity.js';
 
 @Injectable()
 export class ParkingSegmentsService {
   constructor(
     @InjectRepository(ParkingSegment)
-    private readonly parkingSegmentsRepository: Repository<ParkingSegment>,
+    private parkingSegmentsRepository: Repository<ParkingSegment>,
   ) {}
 
-  findAll(): Promise<ParkingSegment[]> {
+  findAll() {
     return this.parkingSegmentsRepository.find({ order: { id: 'ASC' } });
   }
 
-  async findOne(id: number): Promise<ParkingSegment> {
-    const segment = await this.parkingSegmentsRepository.findOneBy({ id });
+  async searchActive(search?: string) {
+    if (!search) return [];
+
+    const escapedTerm = search.replace(/[\\%_]/g, '\\$&');
+    const pattern = ILike(`%${escapedTerm}%`);
+
+    return this.parkingSegmentsRepository.find({
+      where: [
+        { active: true, code: pattern },
+        { active: true, streetName: pattern },
+      ],
+      order: { streetName: 'ASC' },
+      take: 20,
+    });
+  }
+
+  async findActiveByCode(code: string) {
+    const segment = await this.parkingSegmentsRepository.findOneBy({
+      code: code.toUpperCase(),
+      active: true,
+    });
     if (!segment) {
-      throw new NotFoundException(`No existe el tramo ${id}.`);
+      throw new NotFoundException('Tramo inexistente o inactivo.');
     }
     return segment;
   }
 
-  create(dto: CreateParkingSegmentDto): Promise<ParkingSegment> {
+  async requireActive(
+    id: number,
+    manager?: EntityManager,
+    lockMode: 'pessimistic_read' | 'for_no_key_update' = 'pessimistic_read',
+  ) {
+    const repository =
+      manager?.getRepository(ParkingSegment) ?? this.parkingSegmentsRepository;
+    const segment = await repository.findOne({
+      select: { id: true },
+      where: { id, active: true },
+      lock: manager && { mode: lockMode },
+    });
+    if (!segment) {
+      throw new NotFoundException(`No existe el tramo activo ${id}.`);
+    }
+  }
+
+  create(dto: CreateParkingSegmentDto) {
     const segment = this.parkingSegmentsRepository.create(dto);
-    segment.side ??= null;
     return this.save(segment);
   }
 
-  async update(
-    id: number,
-    dto: UpdateParkingSegmentDto,
-  ): Promise<ParkingSegment> {
+  async update(id: number, dto: UpdateParkingSegmentDto) {
     const segment = await this.findOne(id);
     this.parkingSegmentsRepository.merge(segment, dto);
     return this.save(segment);
   }
 
-  async remove(id: number): Promise<void> {
-    const segment = await this.findOne(id);
-    segment.active = false;
-    await this.save(segment);
+  async remove(id: number) {
+    try {
+      const result = await this.parkingSegmentsRepository.delete(id);
+      if (!result.affected) {
+        throw new NotFoundException(`No existe el tramo ${id}.`);
+      }
+    } catch (error) {
+      if (error instanceof QueryFailedError) {
+        const { code } = error.driverError as { code?: string };
+        if (code === '23503')
+          throw new ConflictException(
+            'No se puede eliminar un tramo con registros asociados.',
+          );
+      }
+      throw error;
+    }
   }
 
-  private async save(segment: ParkingSegment): Promise<ParkingSegment> {
+  private async findOne(id: number) {
+    const segment = await this.parkingSegmentsRepository.findOneBy({ id });
+    if (!segment) throw new NotFoundException(`No existe el tramo ${id}.`);
+    return segment;
+  }
+
+  private async save(segment: ParkingSegment) {
     try {
       return await this.parkingSegmentsRepository.save(segment);
     } catch (error) {
@@ -57,9 +112,6 @@ export class ParkingSegmentsService {
         const { code } = error.driverError as { code?: string };
         if (code === '23505') {
           throw new ConflictException('Ya existe un tramo con ese código.');
-        }
-        if (code === '23503') {
-          throw new ConflictException('El tramo tiene registros asociados.');
         }
       }
       throw error;

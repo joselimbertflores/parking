@@ -1,38 +1,20 @@
 # Decisiones de diseño
 
-## Pagos y estacionamientos
-
-- `Payment` registra la intención de pago o el cobro realizado. `ParkingSession` representa el estacionamiento habilitado y se crea únicamente después de confirmar el pago.
-- Se evaluó crear `ParkingSession` desde el inicio con estado `pending` y activarla tras el pago. Se prefirió el modelo actual para evitar gestionar sesiones sin pagar y mantener su vigencia basada únicamente en fechas.
-- En QR, el pago comienza como `pending`, sin sesión asociada. En efectivo, el pago confirmado y la sesión se crean en una misma transacción.
-- Las ampliaciones generan nuevos pagos asociados a la sesión existente, conservando el historial de cobros.
-
-## Estados y vigencia
-
-- `Payment` utiliza `pending`, `confirmed` y `failed` para distinguir el resultado
-  del cobro.
-- `ParkingSession` no necesita estado: su vigencia se calcula mediante `startsAt`
-  y `expiresAt`, evitando estados de vencimiento desactualizados.
-- Las confirmaciones deben ser idempotentes para evitar sesiones o ampliaciones
-  duplicadas.
-
-## Tipo de vehículo
-
-- El enum compartido `VehicleType` admite `car` y `motorcycle`.
-- Se almacena en `Payment` para conservar la solicitud y en `ParkingSession`
-  para registrar el estacionamiento habilitado. La duplicación es intencional;
-  las tarifas actuales no dependen del tipo de vehículo.
-
-## Base de datos
-
-- Durante el desarrollo se utiliza `synchronize` de TypeORM con datos descartables
-  para simplificar los cambios de esquema.
-- Antes del primer despliegue productivo se prepararán las migraciones y se
-  mantendrá `synchronize: false` en producción para controlar los cambios.
-
 ## Alcance
 
-- La primera etapa incluye cobro anticipado, registro y verificación digital de
-  estacionamientos; las multas se implementarán posteriormente para acotar el
-  alcance inicial.
-- La eliminación de boletas físicas requiere validación normativa.
+La primera versión cubre el cobro y la verificación del estacionamiento tarifado ordinario. Los estacionamientos especiales, las autorizaciones y las multas quedan fuera porque tienen procesos distintos.
+
+La eliminación de boletas físicas requiere validación normativa.
+
+## Configuración y opciones
+
+- Crea y edita la única fila de `parking_rates` (`id = 1`) en PostgreSQL. `amount` es el importe en bolivianos e `intervalMinutes` son los minutos por bloque. La tarifa es la misma para todos los vehículos. El tipo de vehículo se registra para la verificación.
+- Configura `parking_schedules` con intervalos semanales sin solapamientos, del lunes (1) al domingo (7). Cada fecha en `parking_holidays` suspende el cobro de toda la jornada. Se usa la hora local de Sacaba (`America/La_Paz`).
+- Las opciones se ofrecen durante un intervalo de cobro. Indican los minutos a pagar, el importe y el vencimiento calculado desde ese momento. Las pausas se saltan al calcular la vigencia. Si al cierre queda una fracción de bloque, se cobra el bloque completo y la sesión vence al cierre. El tiempo termina el mismo día.
+
+## Pagos y verificación
+
+- Efectivo y QR comparten el cálculo de la compra. El efectivo requiere un controlador y guarda el pago y la sesión en la misma transacción. La ruta HTTP sigue deshabilitada hasta integrar SIAU.
+- El QR crea un pago pendiente que guarda el importe y los minutos por bloque cotizados. Si el último bloque es parcial, `quotedExpiresAt` muestra el cierre antes de confirmar. Para simular la confirmación en desarrollo, compila y ejecuta `npm run payment:confirm -- <uuid>`. La integración bancaria está pendiente.
+- Al confirmar, la sesión empieza en ese momento. El QR debe seguir cabiendo en esa fecha local. Una cotización de bloques completos debe seguir cabiendo completa. Una cotización parcial debe conservar el cierre y tener tiempo para el mismo número de bloques. Repetir una confirmación devuelve la sesión existente.
+- La creación de sesiones se serializa por tramo para impedir duplicados vigentes de una placa. La verificación consulta la placa y el tramo usando las fechas guardadas. Los cambios de configuración afectan nuevas compras y la revalidación del horario de QR pendientes. Los importes registrados y las sesiones confirmadas conservan sus valores.
