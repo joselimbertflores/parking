@@ -1,16 +1,9 @@
-import {
-  ConflictException,
-  NotFoundException,
-  Injectable,
-} from '@nestjs/common';
+import { ConflictException, NotFoundException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { ILike, QueryFailedError, Repository } from 'typeorm';
 import type { EntityManager } from 'typeorm';
 
-import type {
-  CreateParkingSegmentDto,
-  UpdateParkingSegmentDto,
-} from '../dto/parking-segment.dto.js';
+import type { CreateParkingSegmentDto, UpdateParkingSegmentDto } from '../dto/parking-segment.dto.js';
 
 import { ParkingSegment } from '../entities/parking-segments.entity.js';
 
@@ -26,7 +19,11 @@ export class ParkingSegmentsService {
   }
 
   async searchActive(search?: string) {
-    if (!search) return [];
+    if (!search)
+      return await this.parkingSegmentsRepository.find({
+        where: { active: true },
+        order: { streetName: 'ASC' },
+      });
 
     const escapedTerm = search.replace(/[\\%_]/g, '\\$&');
     const pattern = ILike(`%${escapedTerm}%`);
@@ -52,20 +49,21 @@ export class ParkingSegmentsService {
     return segment;
   }
 
-  async requireActive(
-    id: number,
-    manager?: EntityManager,
-    lockMode: 'pessimistic_read' | 'for_no_key_update' = 'pessimistic_read',
-  ) {
-    const repository =
-      manager?.getRepository(ParkingSegment) ?? this.parkingSegmentsRepository;
-    const segment = await repository.findOne({
+  async requireActive(id: number) {
+    const active = await this.parkingSegmentsRepository.existsBy({ id, active: true });
+    if (!active) {
+      throw new NotFoundException(`No existe el tramo activo ${id}.`);
+    }
+  }
+
+  async lockForSessionCreation(id: number, manager: EntityManager) {
+    const segment = await manager.findOne(ParkingSegment, {
       select: { id: true },
-      where: { id, active: true },
-      lock: manager && { mode: lockMode },
+      where: { id },
+      lock: { mode: 'for_no_key_update' },
     });
     if (!segment) {
-      throw new NotFoundException(`No existe el tramo activo ${id}.`);
+      throw new NotFoundException(`No existe el tramo ${id}.`);
     }
   }
 
@@ -89,10 +87,7 @@ export class ParkingSegmentsService {
     } catch (error) {
       if (error instanceof QueryFailedError) {
         const { code } = error.driverError as { code?: string };
-        if (code === '23503')
-          throw new ConflictException(
-            'No se puede eliminar un tramo con registros asociados.',
-          );
+        if (code === '23503') throw new ConflictException('No se puede eliminar un tramo con registros asociados.');
       }
       throw error;
     }

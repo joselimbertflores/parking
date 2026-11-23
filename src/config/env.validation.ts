@@ -1,9 +1,8 @@
 import { z } from 'zod';
 
 export const envValidationSchema = z.object({
-  NODE_ENV: z
-    .enum(['development', 'production', 'test'])
-    .default('development'),
+  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+  SIMULATE_QR_PAYMENTS: z.enum(['true', 'false']).default('false'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
   FRONTEND_ORIGIN: z.url({ protocol: /^https?$/ }).optional(),

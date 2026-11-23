@@ -4,9 +4,9 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { Test } from '@nestjs/testing';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import request from 'supertest';
-import { DataSource } from 'typeorm';
+import { DataSource, IsNull } from 'typeorm';
 import type { EntitySubscriberInterface } from 'typeorm';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { VehicleType } from '../src/common/enums/vehicle-type.enum.js';
 import { ParkingHoliday } from '../src/modules/parking/entities/parking-holidays.entity.js';
 import { ParkingRate } from '../src/modules/parking/entities/parking-rates.entity.js';
@@ -137,7 +137,7 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
 
     await app.listen(0, '127.0.0.1');
     http = request(await app.getUrl());
-    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
   }, 20_000);
 
   beforeEach(() => {
@@ -293,6 +293,19 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     expect(await dataSource.getRepository(Payment).countBy({ plate: '1234ABC' })).toBe(0);
   });
 
+  it('rechaza una compra que se solapa con una sesión que todavía no empezó', async () => {
+    const input = paymentInput('FUTURE', 30);
+    await expect(paymentsService.createCash(input, controller.id)).rejects.toMatchObject({ status: 409 });
+    await http.post(qr).send(input).expect(409);
+    expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(1);
+    expect(await dataSource.getRepository(Payment).countBy({ plate: input.plate })).toBe(0);
+  });
+
+  it('permite una compra que empieza justo cuando vence la sesión anterior', async () => {
+    const result = await paymentsService.createCash(paymentInput('ATEND', 30), controller.id);
+    expect(result.session).toMatchObject({ startsAt: at('10:00'), expiresAt: at('10:30') });
+  });
+
   it('solo registra un pago cuando dos cobros en efectivo llegan al mismo tiempo', async () => {
     const input = paymentInput('CONCURRENT');
     const results = await Promise.allSettled([
@@ -310,6 +323,27 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     );
     expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(1);
     expect(await dataSource.getRepository(Payment).countBy({ plate: input.plate })).toBe(1);
+  });
+
+  it('registra ambos cobros simultáneos para placas distintas en el mismo tramo', async () => {
+    const [first, second] = await Promise.all([
+      paymentsService.createCash(paymentInput('CONCURRENT1'), controller.id),
+      paymentsService.createCash(paymentInput('CONCURRENT2'), controller.id),
+    ]);
+    expect(first.session.id).not.toBe(second.session.id);
+    expect(first.session.startsAt).toEqual(second.session.startsAt);
+
+    const payments = dataSource.getRepository(Payment);
+    await expect(payments.findOneByOrFail({ id: first.id })).resolves.toMatchObject({
+      plate: 'CONCURRENT1',
+      parkingSegmentId: segment.id,
+      parkingSessionId: first.session.id,
+    });
+    await expect(payments.findOneByOrFail({ id: second.id })).resolves.toMatchObject({
+      plate: 'CONCURRENT2',
+      parkingSegmentId: segment.id,
+      parkingSessionId: second.session.id,
+    });
   });
 
   it('exige un controlador real y reutiliza las validaciones del pago QR', async () => {
@@ -414,6 +448,60 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
         .expect(404);
     } finally {
       await segments.update(otherSegment.id, { active: true });
+    }
+  });
+
+  it('permite confirmar un QR previo a la desactivación y conserva las sesiones pagadas', async () => {
+    const input = { ...paymentInput('QRINACTIVE', 30), parkingSegmentId: otherSegment.id };
+    const paid = await paymentsService.createCash({ ...input, plate: 'PAIDINACTIVE' }, controller.id);
+    const { body } = await http.post(qr).send(input).expect(201);
+    const segments = dataSource.getRepository(ParkingSegment);
+    await segments.update(otherSegment.id, { active: false });
+    try {
+      const newPurchase = { ...input, plate: 'NEWINACTIVE' };
+      await http.get(`/api/parking/segments/${otherSegment.id}/options`).expect(404);
+      await http.post(qr).send(newPurchase).expect(404);
+      await expect(paymentsService.createCash(newPurchase, controller.id)).rejects.toMatchObject({ status: 404 });
+
+      vi.setSystemTime(at('10:05'));
+      const confirmed = await paymentsService.confirmQrPayment(body.id);
+      expect(confirmed).toMatchObject({
+        status: 'confirmed',
+        session: { startsAt: at('10:05'), expiresAt: at('10:35') },
+      });
+      await expect(paymentsService.confirmQrPayment(body.id)).resolves.toEqual(confirmed);
+      await expect(paymentsService.getStatus(paid.id)).resolves.toMatchObject({
+        status: 'confirmed',
+        session: paid.session,
+      });
+    } finally {
+      await segments.update(otherSegment.id, { active: true });
+    }
+  });
+
+  it('rechaza el QR si se elimina el tramo antes de guardar la intención', async () => {
+    const segments = dataSource.getRepository(ParkingSegment);
+    const temporarySegment = await segments.save({
+      code: 'TR-DELETED',
+      streetName: 'Calle temporal',
+      reference: 'Cruce de prueba',
+      active: true,
+    });
+    const input = { ...paymentInput('QRDELETED'), parkingSegmentId: temporarySegment.id };
+    const removeBeforeInsert: EntitySubscriberInterface<Payment> = {
+      listenTo: () => Payment,
+      async beforeInsert({ entity }) {
+        if (entity.parkingSegmentId === temporarySegment.id) {
+          await segments.delete(temporarySegment.id);
+        }
+      },
+    };
+    dataSource.subscribers.push(removeBeforeInsert);
+    try {
+      await http.post(qr).send(input).expect(404);
+      expect(await dataSource.getRepository(Payment).countBy({ plate: input.plate })).toBe(0);
+    } finally {
+      dataSource.subscribers.splice(dataSource.subscribers.indexOf(removeBeforeInsert), 1);
     }
   });
 
@@ -663,7 +751,34 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(1);
   });
 
-  it('conserva la creación y confirmación idempotente de pagos QR', async () => {
+  it('permite varias intenciones QR y solo confirma una si sus sesiones se solapan', async () => {
+    const input = paymentInput('QRMULTIPLE');
+    const [{ body: first }, { body: second }] = await Promise.all([
+      http.post(qr).send(input).expect(201),
+      http.post(qr).send(input).expect(201),
+    ]);
+    expect(first.id).not.toBe(second.id);
+    expect(first.status).toBe('pending');
+    expect(second.status).toBe('pending');
+
+    const results = await Promise.allSettled([
+      paymentsService.confirmQrPayment(first.id),
+      paymentsService.confirmQrPayment(second.id),
+    ]);
+    expect(results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: 'fulfilled', value: expect.objectContaining({ status: 'confirmed' }) }),
+        expect.objectContaining({ status: 'rejected', reason: expect.objectContaining({ status: 409 }) }),
+      ]),
+    );
+    const payments = dataSource.getRepository(Payment);
+    const scope = { plate: input.plate, parkingSegmentId: input.parkingSegmentId };
+    expect(await payments.countBy({ ...scope, status: 'confirmed' })).toBe(1);
+    expect(await payments.countBy({ ...scope, status: 'pending', parkingSessionId: IsNull() })).toBe(1);
+    expect(await dataSource.getRepository(ParkingSession).countBy(scope)).toBe(1);
+  });
+
+  it('confirma de forma idempotente dos solicitudes simultáneas para el mismo UUID', async () => {
     const { body } = await http.post(qr).send(paymentInput('qr-test')).expect(201);
     expect(body).toEqual({
       id: expect.any(String),
@@ -694,7 +809,101 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     expect(payment).toMatchObject({
       plate: 'QRTEST',
       method: 'qr',
+      parkingSessionId: confirmed.session?.id,
       recordedByUserId: null,
+    });
+    expect(await dataSource.getRepository(ParkingSession).countBy({ plate: 'QRTEST' })).toBe(1);
+  });
+
+  it('revierte la sesión y la confirmación QR si falla la transacción', async () => {
+    const input = paymentInput('QRROLLBACK');
+    const { body } = await http.post(qr).send(input).expect(201);
+    const failure: EntitySubscriberInterface<Payment> = {
+      listenTo: () => Payment,
+      async afterUpdate({ entity, manager }) {
+        if (entity?.status !== 'confirmed') return;
+        const payment = await manager.findOneByOrFail(Payment, { id: body.id });
+        expect(payment).toMatchObject({ status: 'confirmed', parkingSessionId: expect.any(Number) });
+        const session = await manager.findOneByOrFail(ParkingSession, { plate: input.plate });
+        expect(session.id).toBe(payment.parkingSessionId);
+        throw new Error('Fallo después de confirmar el QR');
+      },
+    };
+    dataSource.subscribers.push(failure);
+    try {
+      await expect(paymentsService.confirmQrPayment(body.id)).rejects.toThrow('Fallo después de confirmar el QR');
+      await expect(paymentsService.getStatus(body.id)).resolves.toMatchObject({ status: 'pending', session: null });
+      expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(0);
+    } finally {
+      dataSource.subscribers.splice(dataSource.subscribers.indexOf(failure), 1);
+    }
+    await expect(paymentsService.confirmQrPayment(body.id)).resolves.toMatchObject({ status: 'confirmed' });
+  });
+
+  describe('Simulación de pagos QR', () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      vi.restoreAllMocks();
+    });
+
+    it.each([
+      ['development', undefined],
+      ['development', 'false'],
+      ['production', 'true'],
+      ['test', 'true'],
+    ])('mantiene el QR pendiente con NODE_ENV=%s y SIMULATE_QR_PAYMENTS=%s', async (environment, flag) => {
+      vi.stubEnv('NODE_ENV', environment);
+      vi.stubEnv('SIMULATE_QR_PAYMENTS', flag);
+      const confirm = vi.spyOn(paymentsService, 'confirmQrPayment');
+      const { body } = await http.post(qr).send(paymentInput('QRSIMOFF')).expect(201);
+
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(confirm).not.toHaveBeenCalled();
+      const status = await http.get(`/api/payments/${body.id}`).expect(200);
+      expect(status.body).toMatchObject({ status: 'pending', session: null });
+    });
+
+    it('confirma el QR después de tres segundos y expone la sesión en la consulta', async () => {
+      vi.stubEnv('NODE_ENV', 'development');
+      vi.stubEnv('SIMULATE_QR_PAYMENTS', 'true');
+      const confirm = vi.spyOn(paymentsService, 'confirmQrPayment');
+      const input = paymentInput('QRSIMON', 30);
+      const { body } = await http.post(qr).send(input).expect(201);
+      expect(body).toMatchObject({ status: 'pending', session: null, qr: null });
+      const statusUrl = `/api/payments/${body.id}`;
+
+      await vi.advanceTimersByTimeAsync(2999);
+      const pending = await http.get(statusUrl).expect('Cache-Control', 'no-store').expect(200);
+      expect(pending.body).toMatchObject({ status: 'pending', session: null });
+      expect(confirm).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(confirm).toHaveBeenCalledExactlyOnceWith(body.id);
+      await expect(confirm.mock.results[0].value).resolves.toMatchObject({ status: 'confirmed' });
+      const confirmed = await http.get(statusUrl).expect('Cache-Control', 'no-store').expect(200);
+      expect(confirmed.body).toMatchObject({
+        status: 'confirmed',
+        session: { id: expect.any(Number), startsAt: new Date().toISOString() },
+      });
+      expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(1);
+    });
+
+    it('mantiene pendiente un QR cuando el intento automático llega después del cierre', async () => {
+      vi.stubEnv('NODE_ENV', 'development');
+      vi.stubEnv('SIMULATE_QR_PAYMENTS', 'true');
+      vi.setSystemTime(at('18:00').getTime() - 2000);
+      const confirm = vi.spyOn(paymentsService, 'confirmQrPayment');
+      const input = paymentInput('QRSIMLATE', 30);
+      const { body } = await http.post(qr).send(input).expect(201);
+
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(confirm).toHaveBeenCalledExactlyOnceWith(body.id);
+      await expect(confirm.mock.results[0].value).rejects.toMatchObject({ status: 409 });
+      const status = await http.get(`/api/payments/${body.id}`).expect(200);
+      expect(status.body).toMatchObject({ status: 'pending', session: null });
+      expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(0);
     });
   });
 

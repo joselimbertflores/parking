@@ -2,18 +2,12 @@ import type { ChargeableInterval } from './parking-schedule.js';
 
 const MILLISECONDS_PER_MINUTE = 60_000;
 
-interface ParkingPurchaseWindow {
-  durationMinutes: number;
-  expiresAt: Date;
-  truncatedAtClose: boolean;
-}
-
 // El primer intervalo empieza en el momento de la compra.
 export function* parkingWindows(
   intervals: ChargeableInterval[],
   intervalMinutes: number,
   durationMinutes = intervalMinutes,
-): Generator<ParkingPurchaseWindow, void> {
+) {
   let elapsed = 0;
   for (const { startsAt, endsAt } of intervals) {
     const start = startsAt.getTime();

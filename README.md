@@ -10,6 +10,12 @@ Backend municipal de estacionamiento tarifado, construido con NestJS, TypeORM y 
 
 Swagger está disponible en `/docs`. Consulta las [decisiones del proyecto](docs/decisions.md) y el [modelo de datos](docs/database.md).
 
+### Simulación de pagos QR
+
+La simulación está deshabilitada por defecto. Para habilitarla, configura `NODE_ENV=development` y `SIMULATE_QR_PAYMENTS=true` en `.env` y reinicia el backend. Cada nuevo pago QR se devuelve como `pending`. Unos 3 segundos después, el backend intenta confirmarlo con las reglas habituales. Consulta el estado y la sesión en `GET /api/payments/:id`.
+
+La simulación es temporal y será reemplazada por la integración bancaria.
+
 ## Verificación local
 
 Ejecuta `npm run build`, `npm run lint` y `npm test`. Para integración, ejecuta `pg_virtualenv -t npm run test:e2e` o define `PARKING_TEST_DATABASE_URL` con una base PostgreSQL descartable y ejecuta `npm run test:e2e`.

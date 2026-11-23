@@ -15,7 +15,8 @@ export function isSameParkingDay(first: Date, second: Date): boolean {
   return parkingDate.format(first) === parkingDate.format(second);
 }
 
-export async function getRemainingParkingSchedule(at: Date, manager: EntityManager) {
+export async function getPurchaseTime(manager: EntityManager) {
+  const startsAt = new Date();
   // La fecha local determina qué horario semanal y qué feriados se aplican.
   const intervals = await manager.query<ChargeableInterval[]>(
     `WITH local_day AS (
@@ -28,11 +29,14 @@ export async function getRemainingParkingSchedule(at: Date, manager: EntityManag
        ON schedule."dayOfWeek" = EXTRACT(ISODOW FROM local_day.date)
      WHERE NOT EXISTS (SELECT 1 FROM parking_holidays AS holiday WHERE holiday.date = local_day.date)
      ORDER BY schedule."startTime"`,
-    [at.toISOString(), PARKING_TIME_ZONE],
+    [startsAt.toISOString(), PARKING_TIME_ZONE],
   );
-  const current = intervals.findIndex(({ startsAt, endsAt }) => startsAt <= at && at < endsAt);
+  const current = intervals.findIndex((interval) => interval.startsAt <= startsAt && startsAt < interval.endsAt);
   if (current === -1) {
-    return [];
+    return { startsAt, intervals: [] };
   }
-  return [{ startsAt: at, endsAt: intervals[current].endsAt }, ...intervals.slice(current + 1)];
+  return {
+    startsAt,
+    intervals: [{ startsAt, endsAt: intervals[current].endsAt }, ...intervals.slice(current + 1)],
+  };
 }

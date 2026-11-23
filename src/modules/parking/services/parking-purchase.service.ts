@@ -1,12 +1,13 @@
 import { BadRequestException, ConflictException, Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import type { EntityManager } from 'typeorm';
+
 import type { ParkingPurchaseOptionDto } from '../dto/parking-purchase.dto.js';
-import { ParkingRate } from '../entities/parking-rates.entity.js';
 import { calculateParkingAmount, parkingWindows } from '../parking-purchase.js';
-import { getRemainingParkingSchedule } from '../parking-schedule.js';
-import type { ChargeableInterval } from '../parking-schedule.js';
 import { ParkingSegmentsService } from './parking-segments.service.js';
+import { ParkingRate } from '../entities/parking-rates.entity.js';
+import { getPurchaseTime } from '../parking-schedule.js';
+import type { ChargeableInterval } from '../parking-schedule.js';
 
 @Injectable()
 export class ParkingPurchaseService {
@@ -16,12 +17,12 @@ export class ParkingPurchaseService {
   ) {}
 
   async getOptions(parkingSegmentId: number) {
-    const { intervals } = await this.getPurchaseTime(parkingSegmentId);
-    if (!intervals.length) {
-      return [];
-    }
+    await this.parkingSegmentsService.requireActive(parkingSegmentId);
+    const { intervals } = await getPurchaseTime(this.dataSource.manager);
 
-    const { amount: blockAmount, intervalMinutes } = await this.getRate(this.dataSource.manager);
+    if (!intervals.length) return [];
+
+    const { amount: blockAmount, intervalMinutes } = this.requireRate(await this.getRate());
     const options: ParkingPurchaseOptionDto[] = [];
     for (const { durationMinutes, expiresAt } of parkingWindows(intervals, intervalMinutes)) {
       const amount = calculateParkingAmount(blockAmount, durationMinutes / intervalMinutes);
@@ -30,17 +31,12 @@ export class ParkingPurchaseService {
     return options;
   }
 
-  async getQuote(
-    parkingSegmentId: number,
-    durationMinutes: number,
-    manager: EntityManager,
-    lockMode?: 'for_no_key_update',
-  ) {
-    const { startsAt, intervals } = await this.getPurchaseTime(parkingSegmentId, manager, lockMode);
+  async getQuote(durationMinutes: number, rate: ParkingRate | null, manager = this.dataSource.manager) {
+    const { startsAt, intervals } = await getPurchaseTime(manager);
     if (!intervals.length) {
       throw new ConflictException('En este momento no hay horario de cobro.');
     }
-    const { amount: blockAmount, intervalMinutes } = await this.getRate(manager);
+    const { amount: blockAmount, intervalMinutes } = this.requireRate(rate);
     if (durationMinutes % intervalMinutes !== 0) {
       throw new BadRequestException('La duración debe ser un múltiplo de los minutos por bloque.');
     }
@@ -49,21 +45,13 @@ export class ParkingPurchaseService {
     return { startsAt, ...window, amount, intervalMinutes };
   }
 
-  async getSessionWindow(
-    parkingSegmentId: number,
-    durationMinutes: number,
-    intervalMinutes: number,
-    manager: EntityManager,
-  ) {
-    const { startsAt, intervals } = await this.getPurchaseTime(parkingSegmentId, manager, 'for_no_key_update');
+  async getSessionWindow(durationMinutes: number, intervalMinutes: number, manager: EntityManager) {
+    const { startsAt, intervals } = await getPurchaseTime(manager);
     return { startsAt, ...this.requireWindow(intervals, intervalMinutes, durationMinutes) };
   }
 
-  private async getPurchaseTime(parkingSegmentId: number, manager?: EntityManager, lockMode?: 'for_no_key_update') {
-    await this.parkingSegmentsService.requireActive(parkingSegmentId, manager, lockMode);
-    const startsAt = new Date();
-    const intervals = await getRemainingParkingSchedule(startsAt, manager ?? this.dataSource.manager);
-    return { startsAt, intervals };
+  getRate() {
+    return this.dataSource.manager.findOneBy(ParkingRate, { id: 1 });
   }
 
   private requireWindow(intervals: ChargeableInterval[], intervalMinutes: number, durationMinutes: number) {
@@ -77,11 +65,8 @@ export class ParkingPurchaseService {
     return { expiresAt, quotedExpiresAt: truncatedAtClose ? expiresAt : null };
   }
 
-  private async getRate(manager: EntityManager) {
-    const rate = await manager.findOneBy(ParkingRate, { id: 1 });
-    if (!rate) {
-      throw new ServiceUnavailableException('No se configuró la tarifa general de parqueo.');
-    }
+  private requireRate(rate: ParkingRate | null) {
+    if (!rate) throw new ServiceUnavailableException('No se configuró la tarifa general de parqueo.');
     return rate;
   }
 }

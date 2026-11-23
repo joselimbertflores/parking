@@ -16,6 +16,6 @@ import { ParkingSegmentsService } from './services/parking-segments.service.js';
   imports: [TypeOrmModule.forFeature([ParkingSegment, ParkingRate, ParkingSchedule, ParkingHoliday, ParkingSession])],
   controllers: [ParkingSegmentsController, ParkingPurchaseController, ParkingControlController],
   providers: [ParkingSegmentsService, ParkingPurchaseService, ParkingControlService],
-  exports: [ParkingPurchaseService],
+  exports: [ParkingPurchaseService, ParkingSegmentsService],
 })
 export class ParkingModule {}

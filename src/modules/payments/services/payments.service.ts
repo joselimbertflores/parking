@@ -3,15 +3,19 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
-import { ArrayContains, DataSource, LessThanOrEqual, MoreThan } from 'typeorm';
+import { ArrayContains, DataSource, LessThan, MoreThan, QueryFailedError } from 'typeorm';
 import type { EntityManager } from 'typeorm';
+import type { EnvironmentVariables } from '../../../config/env.validation.js';
 import { ParkingSession } from '../../parking/entities/parking-sessions.entity.js';
 import { isSameParkingDay } from '../../parking/parking-schedule.js';
 import { ParkingPurchaseService } from '../../parking/services/parking-purchase.service.js';
+import { ParkingSegmentsService } from '../../parking/services/parking-segments.service.js';
 import { User } from '../../users/entities/users.entity.js';
 import { CreateParkingPaymentDto } from '../dto/payment.dto.js';
 import type { CashPayment, PaymentStatusDto, QrPaymentDto } from '../dto/payment.dto.js';
@@ -19,21 +23,25 @@ import { Payment } from '../entities/payments.entity.js';
 
 @Injectable()
 export class PaymentsService {
+  private readonly logger = new Logger(PaymentsService.name);
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly parkingPurchaseService: ParkingPurchaseService,
+    private readonly parkingSegmentsService: ParkingSegmentsService,
+    private readonly config: ConfigService<EnvironmentVariables>,
   ) {}
 
-  createQr(input: CreateParkingPaymentDto): Promise<QrPaymentDto> {
+  async createQr(input: CreateParkingPaymentDto): Promise<QrPaymentDto> {
     const { plate, vehicleType, parkingSegmentId, durationMinutes } = input;
-    return this.dataSource.transaction(async (manager) => {
-      const { startsAt, amount, intervalMinutes, quotedExpiresAt } = await this.parkingPurchaseService.getQuote(
-        parkingSegmentId,
-        durationMinutes,
-        manager,
-      );
-      await this.requireNoActiveSession(manager, plate, parkingSegmentId, startsAt);
-      const payment = await manager.save(
+    const manager = this.dataSource.manager;
+    await this.parkingSegmentsService.requireActive(parkingSegmentId);
+    const rate = await this.parkingPurchaseService.getRate();
+    const quote = await this.parkingPurchaseService.getQuote(durationMinutes, rate);
+    const { startsAt, amount, intervalMinutes, quotedExpiresAt } = quote;
+    await this.requireNoOverlappingSession(manager, plate, parkingSegmentId, quote);
+    const payment = await manager
+      .save(
         manager.create(Payment, {
           plate,
           vehicleType,
@@ -50,11 +58,28 @@ export class PaymentsService {
           createdAt: startsAt,
           paidAt: null,
         }),
-      );
+      )
+      .catch((error: unknown) => {
+        if (error instanceof QueryFailedError && (error.driverError as { code?: string }).code === '23503') {
+          throw new NotFoundException(`No existe el tramo ${parkingSegmentId}.`);
+        }
+        throw error;
+      });
 
-      // La integración bancaria completará el campo qr con los datos del proveedor.
-      return Object.assign(this.toStatus(payment, null), { qr: null });
-    });
+    // TODO: Eliminar esta simulación al integrar el proveedor bancario real.
+    if (
+      this.config.get('NODE_ENV', { infer: true }) === 'development' &&
+      this.config.get('SIMULATE_QR_PAYMENTS', { infer: true }) === 'true'
+    ) {
+      setTimeout(() => {
+        void this.confirmQrPayment(payment.id).catch((error: unknown) => {
+          this.logger.warn(`La simulación no pudo confirmar el pago QR ${payment.id}.`, error);
+        });
+      }, 3000).unref();
+    }
+
+    // La integración bancaria completará el campo qr con los datos del proveedor.
+    return Object.assign(this.toStatus(payment, null), { qr: null });
   }
 
   async createCash(input: CreateParkingPaymentDto, controllerId: number): Promise<CashPayment> {
@@ -71,18 +96,21 @@ export class PaymentsService {
     }
     const { plate, vehicleType, parkingSegmentId, durationMinutes } = dto;
 
-    return this.dataSource.transaction('READ COMMITTED', async (manager) => {
-      const isController = await manager.existsBy(User, {
-        id: controllerId,
-        roles: ArrayContains(['controller']),
-      });
-      if (!isController) {
-        throw new ForbiddenException('Se requiere un controlador autorizado.');
-      }
+    const isController = await this.dataSource.manager.existsBy(User, {
+      id: controllerId,
+      roles: ArrayContains(['controller']),
+    });
+    if (!isController) {
+      throw new ForbiddenException('Se requiere un controlador autorizado.');
+    }
+    await this.parkingSegmentsService.requireActive(parkingSegmentId);
+    const rate = await this.parkingPurchaseService.getRate();
 
-      const { startsAt, expiresAt, amount, intervalMinutes, quotedExpiresAt } =
-        await this.parkingPurchaseService.getQuote(parkingSegmentId, durationMinutes, manager, 'for_no_key_update');
-      await this.requireNoActiveSession(manager, plate, parkingSegmentId, startsAt);
+    return this.dataSource.transaction('READ COMMITTED', async (manager) => {
+      await this.parkingSegmentsService.lockForSessionCreation(parkingSegmentId, manager);
+      const quote = await this.parkingPurchaseService.getQuote(durationMinutes, rate, manager);
+      const { startsAt, expiresAt, amount, intervalMinutes, quotedExpiresAt } = quote;
+      await this.requireNoOverlappingSession(manager, plate, parkingSegmentId, quote);
 
       const session = await manager.save(
         manager.create(ParkingSession, {
@@ -121,8 +149,8 @@ export class PaymentsService {
     });
   }
 
-  async getStatus(id: string, manager = this.dataSource.manager): Promise<PaymentStatusDto> {
-    const payment = await manager.findOne(Payment, {
+  async getStatus(id: string): Promise<PaymentStatusDto> {
+    const payment = await this.dataSource.manager.findOne(Payment, {
       where: { id },
       relations: { parkingSession: true },
     });
@@ -145,16 +173,21 @@ export class PaymentsService {
         throw new ConflictException('Solo se pueden confirmar pagos QR pendientes.');
       }
       if (payment.status === 'confirmed') {
-        return this.getStatus(id, manager);
+        const session =
+          payment.parkingSessionId === null
+            ? null
+            : await manager.findOneBy(ParkingSession, { id: payment.parkingSessionId });
+        return this.toStatus(payment, session);
       }
 
+      await this.parkingSegmentsService.lockForSessionCreation(payment.parkingSegmentId, manager);
       // El QR conserva el importe y el tamaño del bloque de la cotización.
-      const { startsAt, expiresAt, quotedExpiresAt } = await this.parkingPurchaseService.getSessionWindow(
-        payment.parkingSegmentId,
+      const window = await this.parkingPurchaseService.getSessionWindow(
         payment.durationMinutes,
         payment.intervalMinutes,
         manager,
       );
+      const { startsAt, expiresAt, quotedExpiresAt } = window;
       if (!isSameParkingDay(payment.createdAt, startsAt)) {
         throw new ConflictException('El pago QR solo se puede confirmar en la fecha local de su cotización.');
       }
@@ -162,7 +195,7 @@ export class PaymentsService {
       if (quotedExpiresAt?.getTime() !== payment.quotedExpiresAt?.getTime()) {
         throw new ConflictException('La vigencia del estacionamiento ya no coincide con la cotización del pago QR.');
       }
-      await this.requireNoActiveSession(manager, payment.plate, payment.parkingSegmentId, startsAt);
+      await this.requireNoOverlappingSession(manager, payment.plate, payment.parkingSegmentId, window);
       const session = await manager.save(
         manager.create(ParkingSession, {
           plate: payment.plate,
@@ -172,29 +205,31 @@ export class PaymentsService {
           expiresAt,
         }),
       );
-      payment.status = 'confirmed';
-      payment.paidAt = startsAt;
-      payment.parkingSessionId = session.id;
-      await manager.save(payment);
+      await manager.update(Payment, id, {
+        status: 'confirmed',
+        paidAt: startsAt,
+        parkingSessionId: session.id,
+      });
 
+      payment.status = 'confirmed';
       return this.toStatus(payment, session);
     });
   }
 
-  private async requireNoActiveSession(
+  private async requireNoOverlappingSession(
     manager: EntityManager,
     plate: string,
     parkingSegmentId: number,
-    startsAt: Date,
+    { startsAt, expiresAt }: Pick<ParkingSession, 'startsAt' | 'expiresAt'>,
   ) {
-    const alreadyPaid = await manager.existsBy(ParkingSession, {
+    const overlaps = await manager.existsBy(ParkingSession, {
       plate,
       parkingSegmentId,
-      startsAt: LessThanOrEqual(startsAt),
+      startsAt: LessThan(expiresAt),
       expiresAt: MoreThan(startsAt),
     });
-    if (alreadyPaid) {
-      throw new ConflictException('La placa ya tiene una sesión vigente en este tramo.');
+    if (overlaps) {
+      throw new ConflictException('La placa ya tiene una sesión que se solapa con la vigencia solicitada en este tramo.');
     }
   }
 
