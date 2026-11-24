@@ -2,7 +2,6 @@ import type { ChargeableInterval } from './parking-schedule.js';
 
 const MILLISECONDS_PER_MINUTE = 60_000;
 
-// El primer intervalo empieza en el momento de la compra.
 export function* parkingWindows(
   intervals: ChargeableInterval[],
   intervalMinutes: number,
@@ -13,6 +12,7 @@ export function* parkingWindows(
     const start = startsAt.getTime();
     const chargeableUntil = elapsed + endsAt.getTime() - start;
     while (durationMinutes * MILLISECONDS_PER_MINUTE <= chargeableUntil) {
+      // Cada yield entrega una opción. Al restar lo acumulado, solo se suman los minutos que caben en este intervalo.
       yield {
         durationMinutes,
         expiresAt: new Date(start + durationMinutes * MILLISECONDS_PER_MINUTE - elapsed),

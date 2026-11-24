@@ -1,5 +1,6 @@
-import { Body, Controller, ForbiddenException, Get, Header, Param, ParseUUIDPipe, Post } from '@nestjs/common';
+import { Body, Controller, Get, Header, Param, ParseUUIDPipe, Post } from '@nestjs/common';
 import {
+  ApiBadRequestResponse,
   ApiBody,
   ApiConflictResponse,
   ApiCreatedResponse,
@@ -9,7 +10,7 @@ import {
   ApiParam,
   ApiTags,
 } from '@nestjs/swagger';
-import { CreateParkingPaymentDto, PaymentStatusDto, QrPaymentDto } from '../dto/payment.dto.js';
+import { CashPaymentDto, CreateParkingPaymentDto, PaymentStatusDto, QrPaymentDto } from '../dto/payment.dto.js';
 import { PaymentsService } from '../services/payments.service.js';
 
 @ApiTags('Payments')
@@ -22,19 +23,29 @@ export class PaymentsController {
   @ApiBody({ type: CreateParkingPaymentDto })
   @ApiCreatedResponse({ type: QrPaymentDto })
   @ApiConflictResponse({
-    description: 'Fuera del horario de cobro, sin tiempo suficiente o con una sesión vigente.',
+    description: 'Fuera del horario de cobro, sin tiempo suficiente o con sesiones en conflicto.',
   })
   createQr(@Body() dto: CreateParkingPaymentDto) {
     return this.paymentsService.createQr(dto);
   }
 
   @Post('cash')
-  @ApiOperation({ summary: 'Registrar un pago en efectivo (deshabilitado)' })
-  @ApiForbiddenResponse({
-    description: 'El registro en efectivo está deshabilitado hasta integrar SIAU.',
+  @ApiOperation({
+    summary: 'Registrar un pago en efectivo en desarrollo',
+    description: 'Temporalmente disponible con NODE_ENV=development. Registra el pago confirmado sin autenticación.',
   })
-  rejectCash(): never {
-    throw new ForbiddenException('El registro en efectivo está deshabilitado hasta integrar SIAU.');
+  @ApiBody({ type: CreateParkingPaymentDto })
+  @ApiCreatedResponse({ type: CashPaymentDto })
+  @ApiBadRequestResponse({ description: 'Datos del pago inválidos.' })
+  @ApiForbiddenResponse({
+    description: 'El registro en efectivo sin autenticación solo está habilitado en desarrollo.',
+  })
+  @ApiConflictResponse({
+    description: 'Fuera del horario de cobro, sin tiempo suficiente o con sesiones en conflicto.',
+  })
+  createCash(@Body() dto: CreateParkingPaymentDto) {
+    // TODO: Pasar el ID del controlador autenticado cuando se integre SIAU.
+    return this.paymentsService.createCash(dto, null);
   }
 
   @Get(':id')

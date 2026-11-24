@@ -56,7 +56,8 @@ export class ParkingSegmentsService {
     }
   }
 
-  async lockForSessionCreation(id: number, manager: EntityManager) {
+  async lockForSessionPurchase(id: number, manager: EntityManager) {
+    // El bloqueo por tramo serializa las compras incluso antes de que exista una sesión que bloquear.
     const segment = await manager.findOne(ParkingSegment, {
       select: { id: true },
       where: { id },

@@ -1,21 +1,19 @@
 # Decisiones de diseño
 
-## Alcance
-
-La primera versión cubre el cobro y la verificación del estacionamiento tarifado ordinario. Los estacionamientos especiales, las autorizaciones y las multas quedan fuera porque tienen procesos distintos.
-
-La eliminación de boletas físicas requiere validación normativa.
-
 ## Configuración y opciones
 
-- Crea y edita la única fila de `parking_rates` (`id = 1`) en PostgreSQL. `amount` es el importe en bolivianos e `intervalMinutes` son los minutos por bloque. La tarifa es la misma para todos los vehículos. El tipo de vehículo se registra para la verificación.
-- Configura `parking_schedules` con intervalos semanales sin solapamientos, del lunes (1) al domingo (7). Cada fecha en `parking_holidays` suspende el cobro de toda la jornada. Se usa la hora local de Sacaba (`America/La_Paz`).
-- Las opciones se ofrecen durante un intervalo de cobro. Indican los minutos a pagar, el importe y el vencimiento calculado desde ese momento. Las pausas se saltan al calcular la vigencia. Si al cierre queda una fracción de bloque, se cobra el bloque completo y la sesión vence al cierre. El tiempo termina el mismo día.
+- El horario semanal admite varios intervalos sin solapamientos por día y usa la hora local de Sacaba (`America/La_Paz`). Los feriados suspenden el cobro de toda la jornada.
+- Solo hay opciones y compras durante un intervalo de cobro. Las pausas se excluyen del tiempo cobrado y pueden quedar dentro de una sesión vigente. Si queda una fracción de bloque al cierre de la jornada, se cobra como bloque completo y la vigencia termina al cierre.
+- Una tarifa general fija el importe en bolivianos y la duración de cada bloque para todos los vehículos. En tramos activos, las opciones generales muestran duraciones e importes desde el momento de la consulta. La disponibilidad para una placa se comprueba al cotizar el pago.
 
-## Pagos y verificación
+## Sesiones y pagos
 
-- Efectivo y QR comparten el cálculo de la compra. El efectivo requiere un controlador y guarda el pago y la sesión en la misma transacción. La ruta HTTP sigue deshabilitada hasta integrar SIAU.
-- Cada intención QR crea un pago pendiente con el importe y los minutos por bloque cotizados. Puede haber varias intenciones pendientes para la misma placa y tramo. Si el último bloque es parcial, `quotedExpiresAt` muestra el cierre antes de confirmar.
-- Para integrar Angular, consulta `GET /api/payments/:id` cada 5 segundos mientras el pago esté pendiente. El botón «Verificar pago» debe consultar de inmediato esa misma ruta de solo lectura. Cuando el estado pase a `confirmed`, detén las consultas, muestra el éxito y permite finalizar. Detén también las consultas al cerrar la pantalla o agotar el tiempo de espera.
-- Al confirmar, la sesión empieza en ese momento. El QR debe seguir cabiendo en esa fecha local. Una cotización de bloques completos debe seguir cabiendo completa. Una cotización parcial debe conservar el cierre y tener tiempo para el mismo número de bloques. Repetir una confirmación devuelve la sesión existente.
-- La creación de sesiones se serializa por tramo para impedir vigencias solapadas de una misma placa. La verificación consulta la placa y el tramo usando las fechas guardadas. Desactivar un tramo impide iniciar nuevas compras. Los QR ya creados pueden confirmarse si siguen cumpliendo las reglas de horario y cotización. Los importes registrados y las sesiones confirmadas conservan sus valores.
+- La cotización valida que la duración quepa en el horario disponible para la placa y el tramo. Al confirmar el pago, se amplía la sesión vigente desde su vencimiento para conservar el tiempo ya comprado. Si no hay una sesión vigente, se inicia una nueva en ese momento.
+- El efectivo se registra confirmado. El QR empieza pendiente y conserva el importe y el tamaño de bloque cotizados. Solo se confirma en la fecha local de la cotización, tras revalidar que los bloques completos sigan cabiendo y que el último bloque parcial conserve el cierre cotizado. Desactivar un tramo bloquea las nuevas compras. Los QR pendientes aún pueden confirmarse si cumplen esas reglas.
+- El pago confirmado y la creación o ampliación de la sesión se guardan en una misma transacción. El registro de efectivo y las confirmaciones QR se serializan por tramo para evitar solapamientos y usar el último vencimiento. Cada QR se aplica una sola vez, incluso ante reintentos.
+- El conductor puede consultar el estado del pago y la vigencia actual de la sesión asociada mediante `GET /api/payments/:id`, con el UUID del pago y sin autenticación.
+
+## Pendientes de integración
+
+- La simulación QR es opcional y solo funciona en desarrollo. La reemplazará la integración con el proveedor bancario.
+- El cobro en efectivo sin autenticación solo está habilitado en desarrollo y se registra sin controlador. Al integrar SIAU, cada cobro en efectivo exigirá un controlador autenticado y registrará su identidad.

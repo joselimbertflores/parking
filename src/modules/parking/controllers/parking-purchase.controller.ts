@@ -35,12 +35,12 @@ export class ParkingPurchaseController {
   @Get(':id/options')
   @Header('Cache-Control', 'no-store')
   @ApiOperation({
-    summary: 'Obtener las duraciones cobrables disponibles en este momento',
+    summary: 'Obtener las opciones generales de compra según el horario y la tarifa vigente',
   })
   @ApiOkResponse({
     type: [ParkingPurchaseOptionDto],
     description:
-      'Las opciones incluyen el vencimiento calculado desde este momento. Devuelve [] fuera del horario de cobro.',
+      'Duraciones cobrables e importes calculados desde el momento de la consulta. Devuelve [] fuera del horario de cobro.',
   })
   getOptions(@Param('id', ParseIntPipe) id: number) {
     return this.parkingPurchaseService.getOptions(id);

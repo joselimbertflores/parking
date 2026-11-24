@@ -202,6 +202,11 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     expect(duringBreak.body).toMatchObject({
       session: { remainingSeconds: 660 },
     });
+    await getOptions().expect(200, []);
+    await http.post(qr).send(paymentInput('BRIDGE', 30)).expect(409);
+    await expect(paymentsService.createCash(paymentInput('BRIDGE', 30), controller.id)).rejects.toMatchObject({
+      status: 409,
+    });
   });
 
   it('valida los parámetros y conserva el acceso a los tramos por código', async () => {
@@ -260,37 +265,56 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     });
   });
 
-  it('revierte la sesión si falla la escritura del pago', async () => {
+  it.each([false, true])('revierte la sesión si falla la escritura del pago (ampliación=%s)', async (extend) => {
+    const input = paymentInput(extend ? 'ROLLBACKEXT' : 'ROLLBACK', 30);
+    const original = extend ? await paymentsService.createCash(input, controller.id) : null;
     const failure: EntitySubscriberInterface<Payment> = {
       listenTo: () => Payment,
       async beforeInsert({ entity, manager }) {
-        if (entity.plate === 'ROLLBACK') {
+        if (entity.plate === input.plate) {
           const session = await manager.findOneBy(ParkingSession, {
             plate: entity.plate,
           });
           expect(session?.id).toBe(entity.parkingSessionId);
+          expect(session?.expiresAt).toEqual(at(extend ? '11:00' : '10:30'));
           throw new Error('Fallo de escritura del pago');
         }
       },
     };
     dataSource.subscribers.push(failure);
     try {
-      await expect(paymentsService.createCash(paymentInput('ROLLBACK'), controller.id)).rejects.toThrow(
-        'Fallo de escritura del pago',
-      );
-      expect(await dataSource.getRepository(ParkingSession).countBy({ plate: 'ROLLBACK' })).toBe(0);
-      expect(await dataSource.getRepository(Payment).countBy({ plate: 'ROLLBACK' })).toBe(0);
+      await expect(paymentsService.createCash(input, controller.id)).rejects.toThrow('Fallo de escritura del pago');
+      const sessions = await dataSource.getRepository(ParkingSession).findBy({ plate: input.plate });
+      expect(sessions).toEqual(original ? [expect.objectContaining(original.session)] : []);
+      expect(await dataSource.getRepository(Payment).countBy({ plate: input.plate })).toBe(original ? 1 : 0);
     } finally {
       dataSource.subscribers.splice(dataSource.subscribers.indexOf(failure), 1);
     }
   });
 
-  it('rechaza el efectivo si la placa ya tiene una sesión vigente en el tramo', async () => {
-    await expect(paymentsService.createCash(paymentInput('1234-aBc'), controller.id)).rejects.toMatchObject({
-      status: 409,
+  it('cotiza y amplía la misma sesión en efectivo desde el vencimiento vigente', async () => {
+    const input = paymentInput('cas-h ext', 30);
+    const original = await paymentsService.createCash(input, controller.id);
+    vi.setSystemTime(at('10:10'));
+
+    const result = await paymentsService.createCash({ ...input, vehicleType: VehicleType.Car }, controller.id);
+    expect(result).toMatchObject({
+      amount: '1.25',
+      paidAt: at('10:10'),
+      session: { id: original.session.id, startsAt: original.session.startsAt, expiresAt: at('11:00') },
     });
-    await http.post(qr).send(paymentInput('1234-aBc')).expect(409);
-    expect(await dataSource.getRepository(Payment).countBy({ plate: '1234ABC' })).toBe(0);
+    const sessions = await dataSource.getRepository(ParkingSession).findBy({ plate: 'CASHEXT' });
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject(result.session);
+    expect(sessions[0].vehicleType).toBe(VehicleType.Motorcycle);
+    const payments = await dataSource.getRepository(Payment).findBy({ parkingSessionId: result.session.id });
+    expect(payments).toHaveLength(2);
+    expect(payments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: original.id, paidAt: at('10:00'), amount: '1.25' }),
+        expect.objectContaining({ id: result.id, paidAt: at('10:10'), amount: '1.25' }),
+      ]),
+    );
   });
 
   it('rechaza una compra que se solapa con una sesión que todavía no empezó', async () => {
@@ -302,27 +326,25 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
   });
 
   it('permite una compra que empieza justo cuando vence la sesión anterior', async () => {
+    const sessions = dataSource.getRepository(ParkingSession);
+    const previous = await sessions.findOneByOrFail({ plate: 'ATEND' });
     const result = await paymentsService.createCash(paymentInput('ATEND', 30), controller.id);
     expect(result.session).toMatchObject({ startsAt: at('10:00'), expiresAt: at('10:30') });
+    expect(result.session.id).not.toBe(previous.id);
+    await expect(sessions.findOneBy({ id: previous.id })).resolves.toEqual(previous);
   });
 
-  it('solo registra un pago cuando dos cobros en efectivo llegan al mismo tiempo', async () => {
+  it('acumula dos cobros en efectivo simultáneos en la misma sesión', async () => {
     const input = paymentInput('CONCURRENT');
-    const results = await Promise.allSettled([
+    const [first, second] = await Promise.all([
       paymentsService.createCash(input, controller.id),
       paymentsService.createCash(input, controller.id),
     ]);
-    expect(results).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ status: 'fulfilled' }),
-        expect.objectContaining({
-          status: 'rejected',
-          reason: expect.objectContaining({ status: 409 }),
-        }),
-      ]),
-    );
-    expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(1);
-    expect(await dataSource.getRepository(Payment).countBy({ plate: input.plate })).toBe(1);
+    expect(first.session.id).toBe(second.session.id);
+    expect(await dataSource.getRepository(ParkingSession).findBy({ plate: input.plate })).toEqual([
+      expect.objectContaining({ id: first.session.id, startsAt: at('10:00'), expiresAt: at('16:00') }),
+    ]);
+    expect(await dataSource.getRepository(Payment).countBy({ parkingSessionId: first.session.id })).toBe(2);
   });
 
   it('registra ambos cobros simultáneos para placas distintas en el mismo tramo', async () => {
@@ -358,16 +380,62 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     expect(await dataSource.getRepository(Payment).countBy({ plate: input.plate })).toBe(0);
   });
 
-  it('rechaza el pago en efectivo por HTTP incluso con identidad enviada por el cliente', async () => {
-    const input = paymentInput('BLOCKED');
-    await http.post(cash).send(input).expect(403);
-    await http
-      .post(cash)
-      .set('Authorization', 'Bearer token-de-prueba')
-      .send({ ...input, recordedByUserId: controller.id })
-      .expect(403);
-    expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(0);
-    expect(await dataSource.getRepository(Payment).countBy({ plate: input.plate })).toBe(0);
+  describe('Registro de efectivo sin autenticación', () => {
+    afterEach(() => vi.unstubAllEnvs());
+
+    it.each(['production', 'test'])('rechaza el cobro por HTTP con NODE_ENV=%s', async (environment) => {
+      vi.stubEnv('NODE_ENV', environment);
+      const input = paymentInput('BLOCKED');
+      await http.post(cash).send(input).expect(403);
+      expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(0);
+      expect(await dataSource.getRepository(Payment).countBy({ plate: input.plate })).toBe(0);
+    });
+
+    it('crea y amplía una sesión en desarrollo con pagos confirmados sin controlador', async () => {
+      vi.stubEnv('NODE_ENV', 'development');
+      vi.setSystemTime(at('17:15'));
+      const input = paymentInput('CASHDEV', 30);
+      await http
+        .post(cash)
+        .send({ ...input, recordedByUserId: controller.id })
+        .expect(400);
+      const { body: first } = await http.post(cash).send(input).expect(201);
+      expect(first).toEqual({
+        id: expect.any(String),
+        amount: '1.25',
+        method: 'cash',
+        status: 'confirmed',
+        paidAt: at('17:15').toISOString(),
+        session: { id: expect.any(Number), startsAt: at('17:15').toISOString(), expiresAt: at('17:45').toISOString() },
+      });
+
+      vi.setSystemTime(at('17:20'));
+      const { body: second } = await http.post(cash).send(input).expect(201);
+      expect(second).toMatchObject({
+        amount: '1.25',
+        method: 'cash',
+        status: 'confirmed',
+        session: { ...first.session, expiresAt: at('18:00').toISOString() },
+      });
+      await http.post(cash).send(input).expect(409);
+
+      const payments = dataSource.getRepository(Payment);
+      const saved = await payments.find({ where: { plate: input.plate }, order: { paidAt: 'ASC' } });
+      expect(saved).toEqual(
+        [first.id, second.id].map((id) =>
+          expect.objectContaining({
+            id,
+            method: 'cash',
+            status: 'confirmed',
+            parkingSessionId: first.session.id,
+            recordedByUserId: null,
+          }),
+        ),
+      );
+      await expect(payments.update(first.id, { status: 'pending', parkingSessionId: null })).rejects.toMatchObject({
+        driverError: { code: '23514' },
+      });
+    });
   });
 
   it.each([
@@ -383,14 +451,11 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
       const input = paymentInput(`CLOSE${time.replace(':', '')}`, durationMinutes);
       const { body } = await getOptions().expect(200);
       expect(body).toEqual(
-        Array.from({ length: durationMinutes / 30 }, (_, index) =>
-          expect.objectContaining({
-            durationMinutes: (index + 1) * 30,
-            amount: ((index + 1) * 1.25).toFixed(2),
-          }),
-        ),
+        Array.from({ length: durationMinutes / 30 }, (_, index) => ({
+          durationMinutes: (index + 1) * 30,
+          amount: ((index + 1) * 1.25).toFixed(2),
+        })),
       );
-      expect(body.at(-1).expiresAt).toBe(at('18:00').toISOString());
       const result = await paymentsService.createCash(input, controller.id);
       expect(result).toMatchObject({
         amount,
@@ -405,12 +470,36 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
 
   it('ofrece un solo bloque a las 17:30 y permite comprarlo hasta las 18:00', async () => {
     vi.setSystemTime(at('17:30'));
-    await getOptions().expect(200, [{ durationMinutes: 30, amount: '1.25', expiresAt: at('18:00').toISOString() }]);
+    await getOptions().expect(200, [{ durationMinutes: 30, amount: '1.25' }]);
     await http.post(qr).send(paymentInput('EXACT', 60)).expect(409);
     await expect(paymentsService.createCash(paymentInput('EXACT', 30), controller.id)).resolves.toMatchObject({
       amount: '1.25',
       session: { expiresAt: at('18:00') },
     });
+  });
+
+  it('ofrece opciones generales y rechaza ampliar una sesión que ya vence al cierre', async () => {
+    vi.setSystemTime(at('17:15'));
+    const input = paymentInput('EXTENDCLOSE', 30);
+    const original = await paymentsService.createCash(input, controller.id);
+    vi.setSystemTime(at('17:20'));
+    const closing = at('18:00').toISOString();
+    const { body } = await http.post(qr).send(input).expect(201);
+    expect(body).toMatchObject({ amount: '1.25', quotedExpiresAt: closing });
+    vi.setSystemTime(at('17:25'));
+    await expect(paymentsService.confirmQrPayment(body.id)).resolves.toMatchObject({
+      status: 'confirmed',
+      session: { id: original.session.id, startsAt: original.session.startsAt, expiresAt: at('18:00') },
+    });
+    const options = [
+      { durationMinutes: 30, amount: '1.25' },
+      { durationMinutes: 60, amount: '2.50' },
+    ];
+    await getOptions().expect(200, options);
+    await getOptions().query({ plate: input.plate }).expect(200, options);
+    await http.post(qr).send(input).expect(409);
+    await expect(paymentsService.createCash(input, controller.id)).rejects.toMatchObject({ status: 409 });
+    expect(await dataSource.getRepository(Payment).countBy({ plate: input.plate })).toBe(2);
   });
 
   it.each([
@@ -429,9 +518,7 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
 
   it('usa el cierre del sábado y exige un tramo activo', async () => {
     vi.setSystemTime(at('11:45', '21'));
-    await getOptions().expect(200, [
-      { durationMinutes: 30, amount: '1.25', expiresAt: at('12:00', '21').toISOString() },
-    ]);
+    await getOptions().expect(200, [{ durationMinutes: 30, amount: '1.25' }]);
     const input = paymentInput('SATURDAY', 30);
     const { body } = await http.post(qr).send(input).expect(201);
     await expect(paymentsService.confirmQrPayment(body.id)).resolves.toMatchObject({
@@ -513,7 +600,6 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     const afternoon = { dayOfWeek: 3, startTime: '14:00' };
     await schedules.update(afternoon, { endTime: '18:15' });
     try {
-      await getOptions().expect(200, [{ durationMinutes: 30, amount: '1.25', expiresAt: at('18:15').toISOString() }]);
       await expect(paymentsService.getStatus(paid.id)).resolves.toMatchObject({
         amount: paid.amount,
         session: paid.session,
@@ -525,7 +611,6 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
       expect(body.at(-1)).toEqual({
         durationMinutes: 510,
         amount: '21.25',
-        expiresAt: at('18:15').toISOString(),
       });
       const extendedDay = await http.post(qr).send(paymentInput('LONGDAY', 510)).expect(201);
       expect(extendedDay.body).toMatchObject({
@@ -679,7 +764,6 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
       expect(options.body[0]).toEqual({
         durationMinutes: 45,
         amount: '2.00',
-        expiresAt: at('14:15').toISOString(),
       });
       await http.post(qr).send(paymentInput('OLDMINUTES')).expect(400);
       await expect(paymentsService.confirmQrPayment(body.id)).resolves.toMatchObject({
@@ -716,7 +800,6 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
       expect(body.at(-1)).toEqual({
         durationMinutes: 60,
         amount: '199999999.98',
-        expiresAt: at('18:00').toISOString(),
       });
       const payment = await http.post(qr).send(paymentInput('HIGHAMOUNT', 60)).expect(201);
       expect(payment.body.amount).toBe('199999999.98');
@@ -725,33 +808,27 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     }
   });
 
-  it('solo crea una sesión si compiten el efectivo y la confirmación de un QR', async () => {
+  it('acumula el efectivo y la confirmación de un QR simultáneos en una sola sesión', async () => {
     const input = paymentInput('MIXEDPAYMENT');
     const { body } = await http.post(qr).send(input).expect(201);
-    const results = await Promise.allSettled([
+    const [cashPayment, qrPayment] = await Promise.all([
       paymentsService.createCash(input, controller.id),
       paymentsService.confirmQrPayment(body.id),
     ]);
-    expect(results).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ status: 'fulfilled' }),
-        expect.objectContaining({
-          status: 'rejected',
-          reason: expect.objectContaining({ status: 409 }),
-        }),
-      ]),
-    );
-    await http
+    expect(qrPayment.session?.id).toBe(cashPayment.session.id);
+    const { body: verified } = await http
       .get(verification)
       .query({
         plate: input.plate,
         segmentId: input.parkingSegmentId,
       })
       .expect(200);
+    expect(verified.session).toMatchObject({ id: cashPayment.session.id, expiresAt: at('16:00').toISOString() });
     expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(1);
+    expect(await dataSource.getRepository(Payment).countBy({ parkingSessionId: cashPayment.session.id })).toBe(2);
   });
 
-  it('permite varias intenciones QR y solo confirma una si sus sesiones se solapan', async () => {
+  it('confirma dos intenciones QR simultáneas en la misma sesión si caben los minutos comprados', async () => {
     const input = paymentInput('QRMULTIPLE');
     const [{ body: first }, { body: second }] = await Promise.all([
       http.post(qr).send(input).expect(201),
@@ -761,6 +838,24 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     expect(first.status).toBe('pending');
     expect(second.status).toBe('pending');
 
+    const [one, two] = await Promise.all([
+      paymentsService.confirmQrPayment(first.id),
+      paymentsService.confirmQrPayment(second.id),
+    ]);
+    const session = await dataSource.getRepository(ParkingSession).findOneByOrFail({ plate: input.plate });
+    expect(session.expiresAt).toEqual(at('16:00'));
+    expect(one).toMatchObject({ status: 'confirmed', session: { id: session.id } });
+    expect(two).toMatchObject({ status: 'confirmed', session: { id: session.id } });
+    expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(1);
+  });
+
+  it('deja pendiente el segundo QR simultáneo si se agota el tiempo hasta el cierre', async () => {
+    vi.setSystemTime(at('17:00'));
+    const input = paymentInput('QRFULL', 60);
+    const [{ body: first }, { body: second }] = await Promise.all([
+      http.post(qr).send(input).expect(201),
+      http.post(qr).send(input).expect(201),
+    ]);
     const results = await Promise.allSettled([
       paymentsService.confirmQrPayment(first.id),
       paymentsService.confirmQrPayment(second.id),
@@ -776,6 +871,49 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     expect(await payments.countBy({ ...scope, status: 'confirmed' })).toBe(1);
     expect(await payments.countBy({ ...scope, status: 'pending', parkingSessionId: IsNull() })).toBe(1);
     expect(await dataSource.getRepository(ParkingSession).countBy(scope)).toBe(1);
+  });
+
+  it('mantiene la sesión durante la intención QR y amplía una sola vez al confirmar, saltando la pausa', async () => {
+    vi.setSystemTime(at('11:30'));
+    const input = paymentInput('QREXTEND', 30);
+    const original = await paymentsService.createCash(input, controller.id);
+    expect(original.session.expiresAt).toEqual(at('12:00'));
+
+    vi.setSystemTime(at('11:45'));
+    const { body } = await http.post(qr).send(input).expect(201);
+    expect(body).toMatchObject({ status: 'pending', quotedExpiresAt: null, session: null });
+    await expect(paymentsService.getStatus(original.id)).resolves.toMatchObject({ session: original.session });
+
+    vi.setSystemTime(at('11:50'));
+    const [confirmed, retried] = await Promise.all([
+      paymentsService.confirmQrPayment(body.id),
+      paymentsService.confirmQrPayment(body.id),
+    ]);
+    expect(confirmed).toMatchObject({
+      status: 'confirmed',
+      amount: '1.25',
+      session: { id: original.session.id, startsAt: original.session.startsAt, expiresAt: at('14:30') },
+    });
+    expect(retried).toEqual(confirmed);
+    await expect(paymentsService.getStatus(original.id)).resolves.toMatchObject({ session: confirmed.session });
+    await expect(dataSource.getRepository(Payment).findOneByOrFail({ id: body.id })).resolves.toMatchObject({
+      paidAt: at('11:50'),
+      parkingSessionId: original.session.id,
+    });
+    expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(1);
+    expect(await dataSource.getRepository(Payment).countBy({ parkingSessionId: original.session.id })).toBe(2);
+  });
+
+  it('crea una sesión desde la confirmación QR si la anterior venció después de cotizar', async () => {
+    const input = paymentInput('QREXPIRED', 30);
+    const original = await paymentsService.createCash(input, controller.id);
+    const { body } = await http.post(qr).send(input).expect(201);
+    vi.setSystemTime(at('10:35'));
+    const confirmed = await paymentsService.confirmQrPayment(body.id);
+    expect(confirmed.session).toEqual({ id: expect.any(Number), startsAt: at('10:35'), expiresAt: at('11:05') });
+    expect(confirmed.session?.id).not.toBe(original.session.id);
+    await expect(paymentsService.getStatus(original.id)).resolves.toMatchObject({ session: original.session });
+    expect(await dataSource.getRepository(ParkingSession).countBy({ plate: input.plate })).toBe(2);
   });
 
   it('confirma de forma idempotente dos solicitudes simultáneas para el mismo UUID', async () => {
@@ -796,6 +934,7 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
       session: null,
     });
     await http.get('/api/payments/invalid').expect(400);
+    expect(await dataSource.getRepository(ParkingSession).countBy({ plate: 'QRTEST' })).toBe(0);
     const [confirmed, retried] = await Promise.all([
       paymentsService.confirmQrPayment(body.id),
       paymentsService.confirmQrPayment(body.id),
@@ -933,7 +1072,23 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
       },
     });
     expect(paths['/api/parking/segments/{id}/monitoring']).toBeUndefined();
-    expect(Object.keys(paths[cash].post?.responses ?? {})).toEqual(['403']);
+    expect(paths[cash].post).toMatchObject({
+      requestBody: {
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/CreateParkingPaymentDto' } } },
+      },
+      responses: {
+        '201': { content: { 'application/json': { schema: { $ref: '#/components/schemas/CashPaymentDto' } } } },
+        '403': expect.any(Object),
+        '409': expect.any(Object),
+      },
+    });
+    expect(components?.schemas?.CashPaymentDto).toMatchObject({
+      properties: {
+        method: { enum: ['cash'] },
+        status: { enum: ['confirmed'] },
+        session: { $ref: '#/components/schemas/PaymentSessionDto' },
+      },
+    });
     expect(components?.schemas?.CreateParkingPaymentDto).toMatchObject({
       required: ['plate', 'vehicleType', 'parkingSegmentId', 'durationMinutes'],
       properties: {
@@ -942,7 +1097,10 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
     });
     expect(components?.schemas?.CreateParkingPaymentDto).not.toHaveProperty('properties.type');
     expect(components?.schemas?.CreateParkingPaymentDto).not.toHaveProperty('properties.durationMinutes.maximum');
-    expect(components?.schemas?.ParkingPurchaseOptionDto).toHaveProperty('properties.expiresAt.format', 'date-time');
+    expect(components?.schemas?.ParkingPurchaseOptionDto).toHaveProperty('properties', {
+      durationMinutes: expect.objectContaining({ type: 'integer' }),
+      amount: expect.objectContaining({ type: 'string' }),
+    });
     expect(components?.schemas?.PaymentStatusDto).toHaveProperty('properties.quotedExpiresAt.nullable', true);
     expect(paths[qr].post?.requestBody).toMatchObject({
       content: {
@@ -951,7 +1109,9 @@ describe.skipIf(!databaseUrl && !temporaryCluster)('Control municipal y pagos', 
         },
       },
     });
-    expect(paths['/api/parking/segments/{id}/options'].get?.responses?.['200']).toMatchObject({
+    const options = paths['/api/parking/segments/{id}/options'].get;
+    expect(options?.parameters).toEqual([expect.objectContaining({ name: 'id', in: 'path', required: true })]);
+    expect(options?.responses?.['200']).toMatchObject({
       content: {
         'application/json': {
           schema: {

@@ -1,4 +1,4 @@
-import { ApiExtraModels, ApiProperty, getSchemaPath } from '@nestjs/swagger';
+import { ApiExtraModels, ApiProperty, getSchemaPath, PickType } from '@nestjs/swagger';
 import { IsEnum, IsInt, Max, Min } from 'class-validator';
 import { ParkingPlateDto } from '../../../common/dto/parking-plate.dto.js';
 import { VehicleType } from '../../../common/enums/vehicle-type.enum.js';
@@ -83,9 +83,16 @@ export class QrPaymentDto extends PaymentStatusDto {
   qr: null;
 }
 
-export type CashPayment = Pick<PaymentStatusDto, 'id' | 'amount'> & {
+export class CashPaymentDto extends PickType(PaymentStatusDto, ['id', 'amount']) {
+  @ApiProperty({ enum: ['cash'] })
   method: 'cash';
+
+  @ApiProperty({ enum: ['confirmed'] })
   status: 'confirmed';
+
+  @ApiProperty({ example: '2026-11-18T15:00:00.000Z' })
   paidAt: Date;
+
+  @ApiProperty({ type: PaymentSessionDto })
   session: PaymentSessionDto;
-};
+}

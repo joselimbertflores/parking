@@ -28,11 +28,4 @@ export class ParkingPurchaseOptionDto {
     description: 'Importe en bolivianos con dos decimales.',
   })
   amount: string;
-
-  @ApiProperty({
-    type: String,
-    format: 'date-time',
-    description: 'Vencimiento si la compra comenzara ahora, limitado al cierre.',
-  })
-  expiresAt: Date;
 }

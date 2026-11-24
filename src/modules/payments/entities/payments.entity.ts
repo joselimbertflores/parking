@@ -10,7 +10,8 @@ import { User } from '../../users/entities/users.entity.js';
 @Check('"intervalMinutes" > 0')
 @Check('"amount" >= 0')
 @Check(`"status" = 'confirmed' OR "parkingSessionId" IS NULL`)
-@Check(`"method" <> 'cash' OR ("status" = 'confirmed' AND "recordedByUserId" IS NOT NULL)`)
+// TODO: Volver a exigir recordedByUserId para los pagos en efectivo al integrar SIAU.
+@Check(`"method" <> 'cash' OR "status" = 'confirmed'`)
 export class Payment {
   @PrimaryGeneratedColumn('uuid')
   id: string;
